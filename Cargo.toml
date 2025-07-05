@@ -4,4 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-acpica-sys = { git = "https://github.com/linuiz-project/acpica-sys", tag = "v2025.4.4" }
+
+
+[build-dependencies]
+rand = "*"
+tempdir = "0.3"
+regex = "1.0"
+cc = "1.2"
