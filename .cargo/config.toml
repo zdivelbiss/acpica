@@ -1,0 +1,6 @@
+[registries.crates-io]
+protocol = "sparse"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

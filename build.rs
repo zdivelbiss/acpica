@@ -16,9 +16,7 @@ static SOURCE_INCLUDE_PLATFORM_DIR: LazyLock<PathBuf> =
 static SOURCE_COMPONENTS_DIR: LazyLock<PathBuf> = LazyLock::new(|| SOURCE_DIR.join("components/"));
 
 fn main() {
-    println!("cargo::rerun-if-changed=src/");
     println!("cargo::rerun-if-changed=acpica/source/");
-    println!("cargo::rustc-link-lib=libacpica");
 
     prepare_temp_dir();
     patch_acrust_include();
@@ -47,7 +45,7 @@ fn prepare_temp_dir() {
 
     // copy all of the APCPICA source to the temp dir
     copy_dir_all("acpica/source/", SOURCE_DIR.as_path())
-        .expect("failed to copy ACPICA source files to temporary directory for compilation");
+        .expect("failed to copy ACPICA source files to temporary directory for compilation (do you need to initialize the submodule?)");
 
     // copy the custom platform header we've premade
     fs::copy("acrust.h", SOURCE_INCLUDE_PLATFORM_DIR.join("acrust.h"))
