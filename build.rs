@@ -18,6 +18,7 @@ static SOURCE_COMPONENTS_DIR: LazyLock<PathBuf> = LazyLock::new(|| SOURCE_DIR.jo
 fn main() {
     println!("cargo::rerun-if-changed=src/");
     println!("cargo::rerun-if-changed=acpica/source/");
+    println!("cargo::rustc-link-lib=libacpica");
 
     prepare_temp_dir();
     patch_acrust_include();
@@ -69,8 +70,6 @@ fn patch_acrust_include() {
             "acenv.h should have contained a section of platform-specific includes (or detection failed)"
         );
     }
-
-    
 
     fs::write(acenv_h_path.as_path(), acenv_h_patched.as_bytes())
         .expect("failed to write patched `acenv.h`");
