@@ -99,5 +99,5 @@ fn compile() {
         .flag("-Wno-format-truncation")
         .opt_level(1)
         .files(component_files)
-        .compile("acpica");
+        .compile("acpica_sys");
 }

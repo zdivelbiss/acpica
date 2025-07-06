@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "acpica_sys"
+name = "acpica"
 version = "0.1.0"
 dependencies = [
  "cc",
