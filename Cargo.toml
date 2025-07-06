@@ -6,7 +6,7 @@ license = "BSD-3-Clause"
 repository = "https://github.com/linuiz-project/acpica"
 keywords = ["acpi", "acpica", "x86_64"]
 categories = ["no-std"]
-description = "Advanced wrapping of a statically-linked ACPICA library, exporting all functionality via a Rust-friendly interface."
+description = "Advanced wrapping of the (statically-linked) ACPICA library, exporting all functionality via a Rust-friendly interface."
 
 
 [dependencies]
