@@ -11,6 +11,7 @@ description = "Advanced wrapping of the (statically-linked) ACPICA library, expo
 
 [dependencies]
 spin = { version = "0.10", default-features = false, features = ["once"] }
+error_set = "0.8"
 
 
 [build-dependencies]
