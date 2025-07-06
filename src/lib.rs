@@ -1,5 +1,24 @@
 #![no_std]
 #![feature(allocator_api)]
+#![forbid(stable_features, unsafe_op_in_unsafe_fn)]
+#![deny(
+    clippy::debug_assert_with_mut_call,
+    clippy::float_arithmetic,
+    clippy::as_conversions
+)]
+#![warn(
+    clippy::cargo,
+    clippy::pedantic,
+    clippy::undocumented_unsafe_blocks,
+    clippy::semicolon_inside_block,
+    clippy::semicolon_if_nothing_returned
+)]
+#![allow(
+    dead_code,
+    clippy::missing_const_for_fn,
+    clippy::needless_for_each,
+    clippy::if_not_else
+)]
 
 mod sys;
 
@@ -22,13 +41,7 @@ pub trait AcpiHandler: Send + Sync {
     fn terminate(&self);
 
     /// Returns the physical address of the ACPI RSDP (Root System Description Pointer) table.
-    /// The mechanism used to obtain this pointer is platform and/or OS dependent. There are
-    /// two primary methods used to obtain this pointer and thus implement this interface:
-    /// 1. On IA-32 platforms, the RSDP is obtained by searching the first megabyte of physical
-    ///    memory for the RSDP signature (“RSD PTR “). On these platforms, this interface should
-    ///    be implemented via a call to [`crate::find_root_pointer`].
-    /// 2. On IA-64 platforms, the RSDP is obtained from the EFI (Extended Firmware Interface).
-    ///    The pointer in the EFI information block that is passed to the OS at OS startup.
+    /// The mechanism used to obtain this pointer is platform and/or OS dependent.
     fn get_root_address(&self) -> PhysicalAddress;
 
     /// Maps a physical address into the caller’s address space. The logical address is returned.
@@ -72,6 +85,22 @@ fn get_os_layer() -> &'static dyn AcpiHandler {
         .expect("ACPICA OS layer has not been installed")
 }
 
+/// This function locates and returns the ACPI Root System Description Pointer by scanning
+/// within the first megabyte of physical memory for the RSDP signature. This mechanism is
+/// only applicable to IA-32 systems.
+///
+/// This interface should only be called from [`AcpiHandler::get_root_address`] if this
+/// memory scanning mechanism is appropropriate for the current platform.
+#[cfg(target_arch = "x86")]
 pub fn find_root_pointer() -> PhysicalAddress {
-    todo!()
+    let mut address: usize;
+    let exception_code = unsafe { sys::AcpiFindRootPointer(&mut address) };
+
+    match exception_code {
+        sys::ExceptionCode::OK => address,
+        sys::ExceptionCode::NO_MEMORY => panic!("insufficient dynamic memory"),
+        sys::ExceptionCode::NOT_FOUND => panic!("valid RSDP could not be located"),
+    }
+
+    // TODO use `Result<PhysicalAddress, Error>` as return type
 }

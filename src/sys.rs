@@ -75,9 +75,24 @@ extern "C" fn AcpiOsWritable(Memory: *mut c_void, Length: usize) -> bool {
     )
 }
 
+#[repr(u32)]
+#[allow(clippy::upper_case_acronyms, non_camel_case_types)]
+pub enum ExceptionCode {
+    OK = 0x0000,
+    ERROR = 0x0001,
+    NO_ACPI_TABLES = 0x0002,
+    NO_NAMESPACE = 0x0003,
+    NO_MEMORY = 0x0004,
+    NOT_FOUND = 0x0005,
+    NOT_EXIST = 0x0006,
+}
+
 #[link(name = "acpica_sys")]
 unsafe extern "C" {
     pub fn AcpiInitializeSubsystem();
+
+    #[cfg(target_arch = "x86")]
+    pub fn AcpiFindRootPointer(table_address: &mut usize) -> ExceptionCode;
 }
 
 #[test]
