@@ -11,11 +11,13 @@
     clippy::pedantic,
     clippy::undocumented_unsafe_blocks,
     clippy::semicolon_inside_block,
-    clippy::semicolon_if_nothing_returned
+    clippy::semicolon_if_nothing_returned,
+    clippy::missing_safety_doc
 )]
 #![allow(
     dead_code,
     clippy::missing_const_for_fn,
+    clippy::missing_errors_doc,
     clippy::needless_for_each,
     clippy::if_not_else
 )]
@@ -38,9 +40,10 @@ pub type ExecuteContext = *mut c_void;
 /// subsystem.
 pub trait OsLayer: Send + Sync {
     type ThreadId: Into<u64>;
-    type MutexHandle;
-    type SemaphoreHandle;
-    type LockHandle;
+    type MutexHandle: From<sys::ACPI_MUTEX> + Into<sys::ACPI_MUTEX>;
+    type SemaphoreHandle: From<sys::ACPI_SEMAPHORE> + Into<sys::ACPI_SEMAPHORE>;
+    type SpinlockHandle: From<sys::ACPI_SPINLOCK> + Into<sys::ACPI_SPINLOCK>;
+    type ProcessorFlags: From<sys::ACPI_CPU_FLAGS> + Into<sys::ACPI_CPU_FLAGS>;
 
     /// Allows the OS to initialize itself. It is called during initialization of the ACPICA subsystem.
     fn initialize(&self);
@@ -121,29 +124,83 @@ pub trait OsLayer: Send + Sync {
         &self,
         handle: Self::MutexHandle,
         timeout_ms: u16,
-    ) -> Result<(), error::SyncObjectAcquire>;
+    ) -> Result<(), error::MutexAcquireError>;
 
     /// Release a mutex object.
     ///
     /// The mutex must have be previously acquired via [`OsLayer::mutex_acquire`].
     fn mutex_release(&self, handle: Self::MutexHandle);
+
+    /// Create a standard semaphore.
+    ///
+    /// The `max_units` parameter allows the semaphore to be tailored to specific uses. For example, a
+    /// `max_units` value of one indicates that the semaphore is to be used as a mutex. The underlying
+    /// OS object used to implement this semaphore may be different than if `max_units` is greater than
+    /// one (thus indicating that the semaphore will be used as a general purpose semaphore.) The ACPICA
+    /// Subsystem creates semaphores of both the mutex and general-purpose variety.
+    fn semaphore_create(
+        &self,
+        max_units: u32,
+        initial_units: u32,
+    ) -> Result<Self::SemaphoreHandle, error::SemaphoreCreateError>;
+
+    /// Delete a semaphore.
+    fn semaphore_delete(
+        &self,
+        handle: Self::SemaphoreHandle,
+    ) -> Result<(), error::SemaphoreDeleteError>;
+
+    /// Wait for the specified number of units from a semaphore.
+    ///
+    /// Implementation notes:
+    /// 1. The implementation of this interface must support timeout values of zero. This is frequently
+    ///    used to determine if a call to the interface with an actual timeout value would block. In this
+    ///    case, you must return either a [`Result::Ok`] if the units were obtained immediately, or a
+    ///    [`SemaphoreAcquireError::TImeoutElapsed`][crate::error::SemaphoreAcquireError] to indicate that
+    ///    the requested units are not available. Single-threaded OS implementations should always return
+    ///    [`Result::Ok`] for this interface.
+    /// 2. The implementation must also support arbitrary timed waits in order for ASL functions such as
+    ///    Wait () to work properly.
+    fn semaphore_acquire(
+        &self,
+        handle: Self::SemaphoreHandle,
+        units: u32,
+        timeout_ms: u16,
+    ) -> Result<(), error::SemaphoreAcquireError>;
+
+    /// Send the requested number of units to a semaphore. Single-threaded OS implementations should
+    /// always return [`Result::Ok`] for this interface.
+    fn semaphore_release(
+        &self,
+        handle: Self::SemaphoreHandle,
+        units: u32,
+    ) -> Result<(), error::SemaphoreReleaseError>;
+
+    fn spinlock_create(&self) -> Result<Self::SpinlockHandle, error::SpinlockCreateError>;
+
+    fn spinlock_delete(
+        &self,
+        handle: Self::SpinlockHandle,
+    ) -> Result<(), error::SpinlockDeleteError>;
+
+    fn spinlock_acquire(&self, handle: Self::SpinlockHandle) -> Self::ProcessorFlags;
+
+    fn spinlock_release(&self, handle: Self::SpinlockHandle, flags: Self::ProcessorFlags);
 }
 
-pub static OS_LAYER: spin::Once<&'static dyn OsLayer> = spin::Once::new();
-
-pub fn install(handler: &'static impl OsLayer) {
+pub fn install<T: OsLayer>(os_layer: &'static T) {
     debug_assert!(
-        !OS_LAYER.is_completed(),
+        !sys::OS_LAYER.is_completed(),
         "`acpica_sys::install` has been called more than once; this is likely an error"
     );
 
-    OS_LAYER.call_once(|| handler);
-}
-
-fn get_os_layer() -> &'static dyn OsLayer {
-    *OS_LAYER
-        .get()
-        .expect("ACPICA OS layer has not been installed")
+    sys::OS_LAYER.call_once(|| {
+        // Safety: `Dst` is `#[repr(transparent)]`
+        #[allow(clippy::transmute_ptr_to_ptr)]
+        unsafe {
+            core::mem::transmute::<&T, &'static sys::OsLayerAdapter<T>>(os_layer)
+        }
+    });
 }
 
 /// This function locates and returns the ACPI Root System Description Pointer by scanning
@@ -164,4 +221,12 @@ pub fn find_root_pointer() -> PhysicalAddress {
     }
 
     // TODO use `Result<PhysicalAddress, Error>` as return type
+}
+
+#[test]
+fn test_init() {
+    // Safety: `acpica_sys` exports symbol.
+    unsafe {
+        sys::AcpiInitializeSubsystem();
+    }
 }

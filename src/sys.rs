@@ -5,7 +5,13 @@
     clippy::upper_case_acronyms
 )]
 
-use crate::get_os_layer;
+use crate::{
+    OsLayer,
+    error::{
+        MutexAcquireError, SemaphoreAcquireError, SemaphoreCreateError, SemaphoreDeleteError,
+        SemaphoreReleaseError, SpinlockCreateError,
+    },
+};
 use core::{ffi::c_void, ptr::NonNull};
 
 /// The width of all physical addresses is fixed at 64 bits, regardless of the platform or operating
@@ -17,17 +23,38 @@ pub type ACPI_PHYSICAL_ADDRESS = u64;
 /// Similar to [`ACPI_PHYSICAL_ADDRESS`], except it is used for I/O addresses.
 pub type ACPI_IO_ADDRESS = u64;
 
-/// This data type is 32 bits or 64 bits depending on the platform. It is used in leiu of size_t,
+/// This data type is 32 bits or 64 bits depending on the platform. It is used in leiu of `size_t`,
 /// which cannot be guaranteed to be available.
 pub type ACPI_SIZE = usize;
 
 /// This type is defined as a UINT64 and is returned by the [`AcpiOsGetThreadId`] interface.
-/// There is no standard "thread_id" across operating systems or even the various UNIX systems. Since
-/// ACPICA only needs the thread ID as a unique thread identifier, it uses a UINT64 as the only
+///
+/// There is no standard "thread ID"-type across operating systems or even the various UNIX systems.
+/// Since ACPICA only needs the thread ID as a unique thread identifier, it uses a UINT64 as the only
 /// common data type – a UINT64 will accommodate any type of pointer or any type of integer. It is up
 /// to the host-dependent OSL to cast the native thread ID type to a UINT64 (in [`AcpiOsGetThreadId`])
 /// before returning the value to ACPICA.
 pub type ACPI_THREAD_ID = u64;
+
+/// This type is an OS-dependent handle for a mutex. It is returned by the [`AcpiOsCreateMutex`]
+/// interface, and passed as a parameter to the [`AcpiOsAcquireMutex`] and [`AcpiOsReleaseMutex`]
+/// interfaces.
+pub type ACPI_MUTEX = *mut c_void;
+
+/// This type is an OS-dependent handle for a semaphore. It is returned by the [`AcpiOsCreateSemaphore`]
+/// interface, and passed as a parameter to the [`AcpiOsWaitSemaphore`] and [`AcpiOsSignalSemaphore`]
+/// interfaces.
+pub type ACPI_SEMAPHORE = *mut c_void;
+
+/// This type is an OS-dependent handle for a spinlock. It is returned by the [`AcpiOsCreateLock`]
+/// interface, and passed as a parameter to the [`AcpiOsAcquireLock`] and [`AcpiOsReleaseLock`] interfaces.
+pub type ACPI_SPINLOCK = *mut c_void;
+
+/// This type is used for the value returned from [`AcpiOsAcquireLock`], and the value passed as a
+/// parameter to [`AcpiOsReleaseLock`]. It can be configured to whatever type the host OS uses for CPU
+/// flags that need to be saved and restored across the acquisition and release of a spinlock. The default
+/// value is [`ACPI_SIZE`].
+pub type ACPI_CPU_FLAGS = ACPI_SIZE;
 
 /// Most of the external ACPI interfaces return an exception code of this type as the function return
 /// value.
@@ -178,7 +205,7 @@ extern "C" fn AcpiOsTerminate() {
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsGetRootPointer() -> ACPI_PHYSICAL_ADDRESS {
-    get_os_layer().get_root_address()
+    get_os_layer().get_root_pointer()
 }
 
 #[unsafe(no_mangle)]
@@ -186,110 +213,431 @@ extern "C" fn AcpiOsMapMemory(
     PhysicalAddress: ACPI_PHYSICAL_ADDRESS,
     Length: ACPI_SIZE,
 ) -> *mut c_void {
-    get_os_layer()
-        .map_memory(PhysicalAddress, Length)
-        .map(NonNull::cast)
-        .map(NonNull::as_ptr)
-        .unwrap_or_default()
+    get_os_layer().map_memory(PhysicalAddress, Length)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsUnmapMemory(LogicalAddress: *mut c_void, Length: ACPI_SIZE) {
-    get_os_layer().unmap_memory(
-        NonNull::new(LogicalAddress)
-            .expect("ACPICA provided a null pointer for `AcpiOsUnmapMemory`")
-            .cast(),
-        Length,
-    );
+    get_os_layer().unmap_memory(LogicalAddress, Length);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsGetPhysicalAddress(
     LogicalAddress: *mut c_void,
-    PhysicalAddress: &mut ACPI_PHYSICAL_ADDRESS,
+    PhysicalAddress: Option<NonNull<ACPI_PHYSICAL_ADDRESS>>,
 ) -> ACPI_STATUS {
-    let Some(LogicalAddress) = NonNull::new(LogicalAddress).map(NonNull::cast) else {
-        return ACPI_STATUS::BAD_PARAMETER;
-    };
-
-    *PhysicalAddress = get_os_layer().get_physical_address(LogicalAddress);
-
-    ACPI_STATUS::OK
+    get_os_layer().get_physical_address(LogicalAddress, PhysicalAddress)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsAllocate(Size: ACPI_SIZE) -> *mut c_void {
-    get_os_layer()
-        .allocate(Size)
-        .map(NonNull::cast)
-        .map(NonNull::as_ptr)
-        .unwrap_or_default()
+    get_os_layer().allocate(Size)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsFree(Memory: *mut c_void) {
-    get_os_layer().deallocate(
-        NonNull::new(Memory)
-            .expect("ACPICA provided a null pointer for `AcpiOsFree`")
-            .cast(),
-    );
+    get_os_layer().free(Memory);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsReadable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
-    get_os_layer().is_memory_readable(
-        NonNull::new(Memory)
-            .expect("ACPICA provided a null pointer for `AcpiOsReadable`")
-            .cast(),
-        Length,
-    )
+    get_os_layer().readable(Memory, Length)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsWritable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
-    get_os_layer().is_memory_writable(
-        NonNull::new(Memory)
-            .expect("ACPICA provided a null pointer for `AcpiOsWritable`")
-            .cast(),
-        Length,
-    )
+    get_os_layer().writable(Memory, Length)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsGetThreadId() -> ACPI_THREAD_ID {
-    let thread_id = u64::from(get_os_layer().get_thread_id());
-
-    assert!(
-        thread_id != 0xFFFF_FFFF_FFFF_FFFF,
-        "max thread ID is reserved"
-    );
-
-    thread_id
+    get_os_layer().get_thread_id()
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsExecute(
-    _Type: ACPI_EXECUTE_TYPE,
+    Type: ACPI_EXECUTE_TYPE,
     Function: Option<ACPI_OSD_EXEC_CALLBACK>,
     Context: *mut c_void,
 ) -> ACPI_STATUS {
-    let Some(Function) = Function else {
-        return ACPI_STATUS::BAD_PARAMETER;
-    };
-
-    get_os_layer().execute_callback(Function, Context);
-
-    ACPI_STATUS::OK
+    get_os_layer().execute(Type, Function, Context)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsSleep(Milliseconds: u64) {
-    get_os_layer().sleep_wait_ms(Milliseconds);
+    get_os_layer().sleep(Milliseconds);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn AcpiOsStall(Microseconds: u32) {
-    get_os_layer().spin_wait_us(Microseconds);
+    get_os_layer().stall(Microseconds);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsWaitEventsComplete() {
+    get_os_layer().wait_events_complete();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsCreateMutex(OutHandle: Option<NonNull<ACPI_MUTEX>>) -> ACPI_STATUS {
+    get_os_layer().create_mutex(OutHandle)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsDeleteMutex(Handle: ACPI_MUTEX) {
+    get_os_layer().delete_mutex(Handle);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsAcquireMutex(Handle: ACPI_MUTEX, Timeout: u16) -> ACPI_STATUS {
+    get_os_layer().acquire_mutex(Handle, Timeout)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsReleaseMutex(Handle: ACPI_MUTEX) {
+    get_os_layer().release_mutex(Handle);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsCreateSemaphore(
+    MaxUnits: u32,
+    InitialUnits: u32,
+    Handle: Option<NonNull<ACPI_SEMAPHORE>>,
+) -> ACPI_STATUS {
+    get_os_layer().create_semaphore(MaxUnits, InitialUnits, Handle)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsDeleteSemaphore(Handle: ACPI_SEMAPHORE) -> ACPI_STATUS {
+    get_os_layer().delete_semaphore(Handle)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsWaitSemaphore(Handle: ACPI_SEMAPHORE, Units: u32, Timeout: u16) -> ACPI_STATUS {
+    get_os_layer().wait_semaphore(Handle, Units, Timeout)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsSignalSemaphore(Handle: ACPI_SEMAPHORE, Units: u32) -> ACPI_STATUS {
+    get_os_layer().signal_semaphore(Handle, Units)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsCreateLock(OutHandle: Option<NonNull<ACPI_SPINLOCK>>) -> ACPI_STATUS {
+    get_os_layer().create_lock(OutHandle)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsDeleteLock(Handle: ACPI_SPINLOCK) {
+    get_os_layer().delete_lock(Handle);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsAcquireLock(Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS {
+    get_os_layer().acquire_lock(Handle)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn AcpiOsReleaseLock(Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS) {
+    get_os_layer().release_lock(Handle, Flags);
+}
+
+/// Internal trait implementing ACPICA OS layer functions. It is intended to be
+/// used in conjunction with [`OsLayerAdapter<T>`]. Additionally, breaking out
+/// the direct implementation of the OS layer allows the API-facing trait
+/// ([`OsLayer`][crate::OsLayer]) to utilize associated types for ease of use.
+pub trait OsLayerInternal: Send + Sync {
+    fn initialize(&self);
+    fn terminate(&self);
+
+    fn get_root_pointer(&self) -> ACPI_PHYSICAL_ADDRESS;
+
+    fn map_memory(&self, PhysicalAddress: ACPI_PHYSICAL_ADDRESS, Length: ACPI_SIZE) -> *mut c_void;
+    fn unmap_memory(&self, LogicalAddress: *mut c_void, Length: ACPI_SIZE);
+
+    fn get_physical_address(
+        &self,
+        LogicalAddress: *mut c_void,
+        PhysicalAddress: Option<NonNull<ACPI_PHYSICAL_ADDRESS>>,
+    ) -> ACPI_STATUS;
+
+    fn allocate(&self, Size: ACPI_SIZE) -> *mut c_void;
+    fn free(&self, Memory: *mut c_void);
+
+    fn readable(&self, Memory: *mut c_void, Length: ACPI_SIZE) -> bool;
+    fn writable(&self, Memory: *mut c_void, Length: ACPI_SIZE) -> bool;
+
+    fn get_thread_id(&self) -> ACPI_THREAD_ID;
+
+    fn execute(
+        &self,
+        _Type: ACPI_EXECUTE_TYPE,
+        Function: Option<ACPI_OSD_EXEC_CALLBACK>,
+        Context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn sleep(&self, Milliseconds: u64);
+    fn stall(&self, Microseconds: u32);
+
+    fn wait_events_complete(&self);
+
+    fn create_mutex(&self, OutHandle: Option<NonNull<ACPI_MUTEX>>) -> ACPI_STATUS;
+    fn delete_mutex(&self, Handle: ACPI_MUTEX);
+    fn acquire_mutex(&self, Handle: ACPI_MUTEX, Timeout: u16) -> ACPI_STATUS;
+    fn release_mutex(&self, Handle: ACPI_MUTEX);
+
+    fn create_semaphore(
+        &self,
+        MaxUnits: u32,
+        InitialUnits: u32,
+        Handle: Option<NonNull<ACPI_SEMAPHORE>>,
+    ) -> ACPI_STATUS;
+    fn delete_semaphore(&self, Handle: ACPI_SEMAPHORE) -> ACPI_STATUS;
+    fn wait_semaphore(&self, Handle: ACPI_SEMAPHORE, Units: u32, Timeout: u16) -> ACPI_STATUS;
+    fn signal_semaphore(&self, Handle: ACPI_SEMAPHORE, Units: u32) -> ACPI_STATUS;
+
+    fn create_lock(&self, OutHandle: Option<NonNull<ACPI_SPINLOCK>>) -> ACPI_STATUS;
+    fn delete_lock(&self, Handle: ACPI_SPINLOCK);
+    fn acquire_lock(&self, Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS;
+    fn release_lock(&self, Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS);
+}
+
+/// Adapter type for converting between [`OsLayer`][crate::OsLayer] and [`OsLayerInternal`].
+#[repr(transparent)]
+pub struct OsLayerAdapter<T>(T);
+
+impl<T: OsLayer> OsLayerInternal for OsLayerAdapter<T> {
+    fn initialize(&self) {
+        self.0.initialize();
+    }
+
+    fn terminate(&self) {
+        self.0.terminate();
+    }
+
+    fn get_root_pointer(&self) -> ACPI_PHYSICAL_ADDRESS {
+        self.0.get_root_address()
+    }
+
+    fn map_memory(&self, PhysicalAddress: ACPI_PHYSICAL_ADDRESS, Length: ACPI_SIZE) -> *mut c_void {
+        self.0
+            .map_memory(PhysicalAddress, Length)
+            .map(NonNull::cast)
+            .map(NonNull::as_ptr)
+            .unwrap_or_default()
+    }
+
+    fn unmap_memory(&self, LogicalAddress: *mut c_void, Length: ACPI_SIZE) {
+        self.0.unmap_memory(
+            NonNull::new(LogicalAddress)
+                .expect("ACPICA provided a null pointer for `AcpiOsUnmapMemory`")
+                .cast(),
+            Length,
+        );
+    }
+
+    fn get_physical_address(
+        &self,
+        LogicalAddress: *mut c_void,
+        PhysicalAddress: Option<NonNull<ACPI_PHYSICAL_ADDRESS>>,
+    ) -> ACPI_STATUS {
+        let Some(PhysicalAddress) = PhysicalAddress else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        let Some(LogicalAddress) = NonNull::new(LogicalAddress).map(NonNull::cast) else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        unsafe {
+            PhysicalAddress.write(self.0.get_physical_address(LogicalAddress));
+        }
+
+        ACPI_STATUS::OK
+    }
+
+    fn allocate(&self, Size: ACPI_SIZE) -> *mut c_void {
+        self.0
+            .allocate(Size)
+            .map(NonNull::cast)
+            .map(NonNull::as_ptr)
+            .unwrap_or_default()
+    }
+
+    fn free(&self, Memory: *mut c_void) {
+        self.0.deallocate(
+            NonNull::new(Memory)
+                .expect("ACPICA provided a null pointer for `AcpiOsFree`")
+                .cast(),
+        );
+    }
+
+    fn readable(&self, Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
+        self.0.is_memory_readable(
+            NonNull::new(Memory)
+                .expect("ACPICA provided a null pointer for `AcpiOsReadable`")
+                .cast(),
+            Length,
+        )
+    }
+
+    fn writable(&self, Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
+        self.0.is_memory_writable(
+            NonNull::new(Memory)
+                .expect("ACPICA provided a null pointer for `AcpiOsWritable`")
+                .cast(),
+            Length,
+        )
+    }
+
+    fn get_thread_id(&self) -> u64 {
+        let thread_id = self.0.get_thread_id().into();
+
+        assert!(
+            thread_id != 0xFFFF_FFFF_FFFF_FFFF,
+            "max thread ID is reserved"
+        );
+
+        thread_id
+    }
+
+    fn execute(
+        &self,
+        _Type: ACPI_EXECUTE_TYPE,
+        Function: Option<ACPI_OSD_EXEC_CALLBACK>,
+        Context: *mut c_void,
+    ) -> ACPI_STATUS {
+        let Some(Function) = Function else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        self.0.execute_callback(Function, Context);
+
+        ACPI_STATUS::OK
+    }
+
+    fn sleep(&self, Milliseconds: u64) {
+        self.0.sleep_wait_ms(Milliseconds);
+    }
+
+    fn stall(&self, Microseconds: u32) {
+        self.0.spin_wait_us(Microseconds);
+    }
+
+    fn wait_events_complete(&self) {
+        self.0.wait_callbacks_complete();
+    }
+
+    fn create_mutex(&self, OutHandle: Option<NonNull<ACPI_MUTEX>>) -> ACPI_STATUS {
+        let Some(OutHandle) = OutHandle else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        unsafe {
+            OutHandle.write(self.0.mutex_create().into());
+        }
+
+        ACPI_STATUS::OK
+    }
+
+    fn delete_mutex(&self, Handle: ACPI_MUTEX) {
+        self.0.mutex_delete(Handle.into());
+    }
+
+    fn acquire_mutex(&self, Handle: ACPI_MUTEX, Timeout: u16) -> ACPI_STATUS {
+        match self.0.mutex_acquire(Handle.into(), Timeout) {
+            Ok(()) => ACPI_STATUS::OK,
+            Err(MutexAcquireError::TimeoutElapsed) => ACPI_STATUS::TIME,
+        }
+    }
+
+    fn release_mutex(&self, Handle: ACPI_MUTEX) {
+        self.0.mutex_release(Handle.into());
+    }
+
+    fn create_semaphore(
+        &self,
+        MaxUnits: u32,
+        InitialUnits: u32,
+        OutHandle: Option<NonNull<ACPI_SEMAPHORE>>,
+    ) -> ACPI_STATUS {
+        let Some(OutHandle) = OutHandle else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        match self.0.semaphore_create(MaxUnits, InitialUnits) {
+            Ok(handle) => {
+                unsafe {
+                    OutHandle.write(handle.into());
+                }
+
+                ACPI_STATUS::OK
+            }
+            Err(SemaphoreCreateError::InvalidInitialUnits) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn delete_semaphore(&self, Handle: ACPI_SEMAPHORE) -> ACPI_STATUS {
+        match self.0.semaphore_delete(Handle.into()) {
+            Ok(()) => ACPI_STATUS::OK,
+            Err(SemaphoreDeleteError::InvalidHandle) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn wait_semaphore(&self, Handle: ACPI_SEMAPHORE, Units: u32, Timeout: u16) -> ACPI_STATUS {
+        match self.0.semaphore_acquire(Handle.into(), Units, Timeout) {
+            Ok(()) => ACPI_STATUS::OK,
+            Err(SemaphoreAcquireError::InvalidHandle) => ACPI_STATUS::BAD_PARAMETER,
+            Err(SemaphoreAcquireError::TimeoutElapsed) => ACPI_STATUS::TIME,
+        }
+    }
+
+    fn signal_semaphore(&self, Handle: ACPI_SEMAPHORE, Units: u32) -> ACPI_STATUS {
+        match self.0.semaphore_release(Handle.into(), Units) {
+            Ok(()) => ACPI_STATUS::OK,
+            Err(SemaphoreReleaseError::InvalidHandle) => ACPI_STATUS::BAD_PARAMETER,
+            Err(SemaphoreReleaseError::LimitExceeded) => ACPI_STATUS::LIMIT,
+        }
+    }
+
+    fn create_lock(&self, OutHandle: Option<NonNull<ACPI_SPINLOCK>>) -> ACPI_STATUS {
+        let Some(OutHandle) = OutHandle else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        match self.0.spinlock_create() {
+            Ok(handle) => {
+                // Safety: 
+                unsafe {
+                    OutHandle.write(handle.into());
+                }
+
+                ACPI_STATUS::OK
+            }
+
+            Err(SpinlockCreateError::OutOfMemory) => ACPI_STATUS::NO_MEMORY,
+        }
+    }
+
+    fn delete_lock(&self, Handle: ACPI_SPINLOCK) {
+        todo!()
+    }
+
+    fn acquire_lock(&self, Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS {
+        todo!()
+    }
+
+    fn release_lock(&self, Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS) {
+        todo!()
+    }
+}
+
+pub static OS_LAYER: spin::Once<&'static (dyn OsLayerInternal)> = spin::Once::new();
+
+fn get_os_layer() -> &'static dyn OsLayerInternal {
+    *OS_LAYER
+        .get()
+        .expect("ACPICA OS layer has not been installed")
 }
 
 #[link(name = "acpica_sys")]
@@ -298,12 +646,4 @@ unsafe extern "C" {
 
     #[cfg(target_arch = "x86")]
     pub fn AcpiFindRootPointer(table_address: &mut usize) -> ACPI_STATUS;
-}
-
-#[test]
-fn test_init() {
-    // Safety: `acpica_sys` exports symbol.
-    unsafe {
-        AcpiInitializeSubsystem();
-    }
 }
