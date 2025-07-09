@@ -3,12 +3,6 @@ error_set::error_set! {
         TimeoutElapsed
     };
 
-    SemaphoreError =
-        SemaphoreCreateError
-        || SemaphoreDeleteError
-        || SemaphoreAcquireError
-        || SemaphoreReleaseError;
-
     SemaphoreCreateError = {
         InvalidInitialUnits
     };
@@ -31,7 +25,26 @@ error_set::error_set! {
         OutOfMemory
     };
 
-    SpinlockDeleteError = {
-        InvalidHandle
+    InterruptCallbackInstallError = {
+        InvalidInterrupt,
+        AlreadyInstalled
+    };
+
+    InterruptCallbackRemoveError = {
+        InvalidInterrupt,
+        CallbackMismatch,
+        NotInstalled
+    };
+
+    MemoryIoError = {
+        InvalidAddress,
+    };
+
+    PortIoError = {
+        InvalidAddress,
+    };
+
+    PciIoError = {
+        InvalidAddress,
     };
 }

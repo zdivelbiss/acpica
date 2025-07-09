@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(allocator_api)]
+#![feature(if_let_guard, c_variadic)]
 #![forbid(stable_features, unsafe_op_in_unsafe_fn)]
 #![deny(
     clippy::debug_assert_with_mut_call,
@@ -19,6 +19,7 @@
     clippy::missing_const_for_fn,
     clippy::missing_errors_doc,
     clippy::needless_for_each,
+    clippy::match_same_arms,
     clippy::if_not_else
 )]
 
@@ -29,7 +30,9 @@ pub mod error;
 use core::{ffi::c_void, ptr::NonNull};
 
 pub type PhysicalAddress = u64;
+pub type PortAddress = u64;
 pub type LogicalAddress = NonNull<u8>;
+pub type ExecuteCallback = unsafe extern "C" fn(ExecuteContext);
 pub type ExecuteContext = *mut c_void;
 
 /// Represents implementation of the OS-specific features that are required for use of the ACPICA
@@ -89,11 +92,7 @@ pub trait OsLayer: Send + Sync {
     fn get_thread_id(&self) -> Self::ThreadId;
 
     /// Queues a procedure for later scheduling and execution.
-    fn execute_callback(
-        &self,
-        callback: unsafe extern "C" fn(ExecuteContext),
-        context: ExecuteContext,
-    );
+    fn execute_callback(&self, callback: ExecuteCallback, context: ExecuteContext);
 
     /// This function sleeps for the specified time. Execution of the running thread is suspended
     /// for this time. The sleep granularity is one millisecond.
@@ -156,7 +155,7 @@ pub trait OsLayer: Send + Sync {
     /// 1. The implementation of this interface must support timeout values of zero. This is frequently
     ///    used to determine if a call to the interface with an actual timeout value would block. In this
     ///    case, you must return either a [`Result::Ok`] if the units were obtained immediately, or a
-    ///    [`SemaphoreAcquireError::TImeoutElapsed`][crate::error::SemaphoreAcquireError] to indicate that
+    ///    [`SemaphoreAcquireError::TimeoutElapsed`][crate::error::SemaphoreAcquireError] to indicate that
     ///    the requested units are not available. Single-threaded OS implementations should always return
     ///    [`Result::Ok`] for this interface.
     /// 2. The implementation must also support arbitrary timed waits in order for ASL functions such as
@@ -178,14 +177,121 @@ pub trait OsLayer: Send + Sync {
 
     fn spinlock_create(&self) -> Result<Self::SpinlockHandle, error::SpinlockCreateError>;
 
-    fn spinlock_delete(
-        &self,
-        handle: Self::SpinlockHandle,
-    ) -> Result<(), error::SpinlockDeleteError>;
+    fn spinlock_delete(&self, handle: Self::SpinlockHandle);
 
     fn spinlock_acquire(&self, handle: Self::SpinlockHandle) -> Self::ProcessorFlags;
 
     fn spinlock_release(&self, handle: Self::SpinlockHandle, flags: Self::ProcessorFlags);
+
+    fn install_interrupt_callback(
+        &self,
+        vector: u32,
+        callback: ExecuteCallback,
+        context: ExecuteContext,
+    ) -> Result<(), error::InterruptCallbackInstallError>;
+
+    fn remove_interrupt_callback(
+        &self,
+        vector: u32,
+        callback: ExecuteCallback,
+    ) -> Result<(), error::InterruptCallbackRemoveError>;
+
+    fn memory_read_u8(&self, address: PhysicalAddress) -> Result<u8, error::MemoryIoError>;
+    fn memory_read_u16(&self, address: PhysicalAddress) -> Result<u16, error::MemoryIoError>;
+    fn memory_read_u32(&self, address: PhysicalAddress) -> Result<u32, error::MemoryIoError>;
+    fn memory_read_u64(&self, address: PhysicalAddress) -> Result<u64, error::MemoryIoError>;
+
+    fn memory_write_u8(
+        &self,
+        address: PhysicalAddress,
+        value: u8,
+    ) -> Result<(), error::MemoryIoError>;
+    fn memory_write_u16(
+        &self,
+        address: PhysicalAddress,
+        value: u16,
+    ) -> Result<(), error::MemoryIoError>;
+    fn memory_write_u32(
+        &self,
+        address: PhysicalAddress,
+        value: u32,
+    ) -> Result<(), error::MemoryIoError>;
+    fn memory_write_u64(
+        &self,
+        address: PhysicalAddress,
+        value: u64,
+    ) -> Result<(), error::MemoryIoError>;
+
+    fn port_read_u8(&self, address: PortAddress) -> Result<u8, error::PortIoError>;
+    fn port_read_u16(&self, address: PortAddress) -> Result<u16, error::PortIoError>;
+    fn port_read_u32(&self, address: PortAddress) -> Result<u32, error::PortIoError>;
+
+    fn port_write_u8(&self, address: PortAddress, value: u8) -> Result<(), error::PortIoError>;
+    fn port_write_u16(&self, address: PortAddress, value: u16) -> Result<(), error::PortIoError>;
+    fn port_write_u32(&self, address: PortAddress, value: u32) -> Result<(), error::PortIoError>;
+
+    fn pci_read_u8(&self, segment: u16, bus: u16, device: u16, function: u16, register: u32) -> u8;
+    fn pci_read_u16(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+    ) -> u16;
+    fn pci_read_u32(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+    ) -> u32;
+    fn pci_read_u64(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+    ) -> u64;
+
+    fn pci_write_u8(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+        value: u8,
+    );
+    fn pci_write_u16(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+        value: u16,
+    );
+    fn pci_write_u32(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+        value: u32,
+    );
+    fn pci_write_u64(
+        &self,
+        segment: u16,
+        bus: u16,
+        device: u16,
+        function: u16,
+        register: u32,
+        value: u64,
+    );
 }
 
 pub fn install<T: OsLayer>(os_layer: &'static T) {

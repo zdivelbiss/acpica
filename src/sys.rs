@@ -8,11 +8,15 @@
 use crate::{
     OsLayer,
     error::{
-        MutexAcquireError, SemaphoreAcquireError, SemaphoreCreateError, SemaphoreDeleteError,
-        SemaphoreReleaseError, SpinlockCreateError,
+        InterruptCallbackInstallError, InterruptCallbackRemoveError, MemoryIoError,
+        MutexAcquireError, PortIoError, SemaphoreAcquireError, SemaphoreCreateError,
+        SemaphoreDeleteError, SemaphoreReleaseError, SpinlockCreateError,
     },
 };
-use core::{ffi::c_void, ptr::NonNull};
+use core::{
+    ffi::{VaListImpl, c_char, c_void},
+    ptr::NonNull,
+};
 
 /// The width of all physical addresses is fixed at 64 bits, regardless of the platform or operating
 /// system. Logical addresses (pointers) remain the natural width of the machine (i.e. 32-bit pointers on
@@ -26,6 +30,11 @@ pub type ACPI_IO_ADDRESS = u64;
 /// This data type is 32 bits or 64 bits depending on the platform. It is used in leiu of `size_t`,
 /// which cannot be guaranteed to be available.
 pub type ACPI_SIZE = usize;
+
+/// A conventional [`*const c_char`][core::ffi::c_char] null-terminated ASCII string. It is used whenever a full ACPI
+/// pathname or other variable-length string is required. This data type was defined to strongly
+/// differentiate it from the `ACPI_NAME` (not implemented) data type.
+pub type ACPI_STRING = *const c_char;
 
 /// This type is defined as a UINT64 and is returned by the [`AcpiOsGetThreadId`] interface.
 ///
@@ -55,6 +64,44 @@ pub type ACPI_SPINLOCK = *mut c_void;
 /// flags that need to be saved and restored across the acquisition and release of a spinlock. The default
 /// value is [`ACPI_SIZE`].
 pub type ACPI_CPU_FLAGS = ACPI_SIZE;
+
+pub type ACPI_OSD_EXEC_CALLBACK = unsafe extern "C" fn(*mut c_void);
+
+pub type ACPI_OSD_HANDLER = unsafe extern "C" fn(*mut c_void);
+
+#[repr(C)]
+pub struct ACPI_PCI_ID {
+    Segment: u16,
+    Bus: u16,
+    Device: u16,
+    Function: u16,
+}
+
+#[repr(u32)]
+pub enum ACPI_SIGNAL {
+    FATAL = 0,
+    BREAKPOINT = 1,
+}
+
+#[repr(C)]
+pub struct ACPI_PREDEFINED_NAMES {
+    Name: *const c_char,
+    Type: u8,
+    Val: *mut c_char,
+}
+
+#[repr(C)]
+pub struct ACPI_TABLE_HEADER {
+    Signature: [c_char; 4],
+    Length: u32,
+    Revision: u8,
+    Checksum: u8,
+    OemId: [c_char; 6],
+    OemTableId: [c_char; 8],
+    OemRevision: u32,
+    AslCompilerId: [c_char; 4],
+    AslCompilerRevision: u32,
+}
 
 /// Most of the external ACPI interfaces return an exception code of this type as the function return
 /// value.
@@ -174,14 +221,6 @@ pub enum ACPI_STATUS {
     CTRL_PARSE_PENDING = 0x400C,
 }
 
-impl ACPI_STATUS {
-    pub fn is_success(self) -> bool {
-        self == Self::OK
-    }
-}
-
-pub type ACPI_OSD_EXEC_CALLBACK = unsafe extern "C" fn(*mut c_void);
-
 #[repr(u32)]
 pub enum ACPI_EXECUTE_TYPE {
     OSL_GLOBAL_LOCK_HANDLER = 0,
@@ -194,22 +233,47 @@ pub enum ACPI_EXECUTE_TYPE {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsInitialize() {
+unsafe extern "C" fn AcpiOsInitialize() {
     get_os_layer().initialize();
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsTerminate() {
+unsafe extern "C" fn AcpiOsTerminate() {
     get_os_layer().terminate();
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsGetRootPointer() -> ACPI_PHYSICAL_ADDRESS {
+unsafe extern "C" fn AcpiOsGetRootPointer() -> ACPI_PHYSICAL_ADDRESS {
     get_os_layer().get_root_pointer()
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsMapMemory(
+unsafe extern "C" fn AcpiOsPredefinedOverride(
+    PredefinedObject: *const ACPI_PREDEFINED_NAMES,
+    NewValue: *mut ACPI_STRING,
+) -> ACPI_STATUS {
+    get_os_layer().predefined_override(PredefinedObject, NewValue)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsTableOverride(
+    ExistingTable: *mut ACPI_TABLE_HEADER,
+    NewTable: *mut *mut ACPI_TABLE_HEADER,
+) -> ACPI_STATUS {
+    get_os_layer().table_override(ExistingTable, NewTable)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsPhysicalTableOverride(
+    ExistingTable: *mut ACPI_TABLE_HEADER,
+    NewAddress: *mut ACPI_PHYSICAL_ADDRESS,
+    NewTableLength: u32,
+) -> ACPI_STATUS {
+    get_os_layer().physical_table_override(ExistingTable, NewAddress, NewTableLength)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsMapMemory(
     PhysicalAddress: ACPI_PHYSICAL_ADDRESS,
     Length: ACPI_SIZE,
 ) -> *mut c_void {
@@ -217,12 +281,12 @@ extern "C" fn AcpiOsMapMemory(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsUnmapMemory(LogicalAddress: *mut c_void, Length: ACPI_SIZE) {
+unsafe extern "C" fn AcpiOsUnmapMemory(LogicalAddress: *mut c_void, Length: ACPI_SIZE) {
     get_os_layer().unmap_memory(LogicalAddress, Length);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsGetPhysicalAddress(
+unsafe extern "C" fn AcpiOsGetPhysicalAddress(
     LogicalAddress: *mut c_void,
     PhysicalAddress: Option<NonNull<ACPI_PHYSICAL_ADDRESS>>,
 ) -> ACPI_STATUS {
@@ -230,32 +294,32 @@ extern "C" fn AcpiOsGetPhysicalAddress(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsAllocate(Size: ACPI_SIZE) -> *mut c_void {
+unsafe extern "C" fn AcpiOsAllocate(Size: ACPI_SIZE) -> *mut c_void {
     get_os_layer().allocate(Size)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsFree(Memory: *mut c_void) {
+unsafe extern "C" fn AcpiOsFree(Memory: *mut c_void) {
     get_os_layer().free(Memory);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsReadable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
+unsafe extern "C" fn AcpiOsReadable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
     get_os_layer().readable(Memory, Length)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsWritable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
+unsafe extern "C" fn AcpiOsWritable(Memory: *mut c_void, Length: ACPI_SIZE) -> bool {
     get_os_layer().writable(Memory, Length)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsGetThreadId() -> ACPI_THREAD_ID {
+unsafe extern "C" fn AcpiOsGetThreadId() -> ACPI_THREAD_ID {
     get_os_layer().get_thread_id()
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsExecute(
+unsafe extern "C" fn AcpiOsExecute(
     Type: ACPI_EXECUTE_TYPE,
     Function: Option<ACPI_OSD_EXEC_CALLBACK>,
     Context: *mut c_void,
@@ -264,42 +328,42 @@ extern "C" fn AcpiOsExecute(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsSleep(Milliseconds: u64) {
+unsafe extern "C" fn AcpiOsSleep(Milliseconds: u64) {
     get_os_layer().sleep(Milliseconds);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsStall(Microseconds: u32) {
+unsafe extern "C" fn AcpiOsStall(Microseconds: u32) {
     get_os_layer().stall(Microseconds);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsWaitEventsComplete() {
+unsafe extern "C" fn AcpiOsWaitEventsComplete() {
     get_os_layer().wait_events_complete();
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsCreateMutex(OutHandle: Option<NonNull<ACPI_MUTEX>>) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsCreateMutex(OutHandle: Option<NonNull<ACPI_MUTEX>>) -> ACPI_STATUS {
     get_os_layer().create_mutex(OutHandle)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsDeleteMutex(Handle: ACPI_MUTEX) {
+unsafe extern "C" fn AcpiOsDeleteMutex(Handle: ACPI_MUTEX) {
     get_os_layer().delete_mutex(Handle);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsAcquireMutex(Handle: ACPI_MUTEX, Timeout: u16) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsAcquireMutex(Handle: ACPI_MUTEX, Timeout: u16) -> ACPI_STATUS {
     get_os_layer().acquire_mutex(Handle, Timeout)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsReleaseMutex(Handle: ACPI_MUTEX) {
+unsafe extern "C" fn AcpiOsReleaseMutex(Handle: ACPI_MUTEX) {
     get_os_layer().release_mutex(Handle);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsCreateSemaphore(
+unsafe extern "C" fn AcpiOsCreateSemaphore(
     MaxUnits: u32,
     InitialUnits: u32,
     Handle: Option<NonNull<ACPI_SEMAPHORE>>,
@@ -308,38 +372,164 @@ extern "C" fn AcpiOsCreateSemaphore(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsDeleteSemaphore(Handle: ACPI_SEMAPHORE) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsDeleteSemaphore(Handle: ACPI_SEMAPHORE) -> ACPI_STATUS {
     get_os_layer().delete_semaphore(Handle)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsWaitSemaphore(Handle: ACPI_SEMAPHORE, Units: u32, Timeout: u16) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsWaitSemaphore(
+    Handle: ACPI_SEMAPHORE,
+    Units: u32,
+    Timeout: u16,
+) -> ACPI_STATUS {
     get_os_layer().wait_semaphore(Handle, Units, Timeout)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsSignalSemaphore(Handle: ACPI_SEMAPHORE, Units: u32) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsSignalSemaphore(Handle: ACPI_SEMAPHORE, Units: u32) -> ACPI_STATUS {
     get_os_layer().signal_semaphore(Handle, Units)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsCreateLock(OutHandle: Option<NonNull<ACPI_SPINLOCK>>) -> ACPI_STATUS {
+unsafe extern "C" fn AcpiOsCreateLock(OutHandle: Option<NonNull<ACPI_SPINLOCK>>) -> ACPI_STATUS {
     get_os_layer().create_lock(OutHandle)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsDeleteLock(Handle: ACPI_SPINLOCK) {
+unsafe extern "C" fn AcpiOsDeleteLock(Handle: ACPI_SPINLOCK) {
     get_os_layer().delete_lock(Handle);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsAcquireLock(Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS {
+unsafe extern "C" fn AcpiOsAcquireLock(Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS {
     get_os_layer().acquire_lock(Handle)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn AcpiOsReleaseLock(Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS) {
+unsafe extern "C" fn AcpiOsReleaseLock(Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS) {
     get_os_layer().release_lock(Handle, Flags);
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsInstallInterruptHandler(
+    InterruptLevel: u32,
+    Handler: Option<ACPI_OSD_HANDLER>,
+    Context: *mut c_void,
+) -> ACPI_STATUS {
+    get_os_layer().install_interrupt_handler(InterruptLevel, Handler, Context)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsRemoveInterruptHandler(
+    InterruptNumber: u32,
+    Handler: Option<ACPI_OSD_HANDLER>,
+) -> ACPI_STATUS {
+    get_os_layer().remove_interrupt_handler(InterruptNumber, Handler)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsReadMemory(
+    Address: ACPI_PHYSICAL_ADDRESS,
+    Value: *mut u64,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().read_memory(Address, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsWriteMemory(
+    Address: ACPI_PHYSICAL_ADDRESS,
+    Value: u64,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().write_memory(Address, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsReadPort(
+    Address: ACPI_IO_ADDRESS,
+    Value: *mut u32,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().read_port(Address, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsWritePort(
+    Address: ACPI_IO_ADDRESS,
+    Value: u32,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().write_port(Address, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsReadPciConfiguration(
+    PciId: ACPI_PCI_ID,
+    Register: u32,
+    Value: *mut u64,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().read_pci_configuration(PciId, Register, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsWritePciConfiguration(
+    PciId: ACPI_PCI_ID,
+    Register: u32,
+    Value: u64,
+    Width: u32,
+) -> ACPI_STATUS {
+    get_os_layer().write_pci_configuration(PciId, Register, Value, Width)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsPrintf() {
+    unimplemented!("not supported by `acpica_sys`")
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsVprintf(Format: *const c_char, Args: ...) {
+    get_os_layer().vprintf(Format, Args);
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsRedirectOutput(Destination: *mut c_void) {
+    get_os_layer().redirect_output(Destination);
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsGetTableByAddress() {
+    unimplemented!("not supported by `acpica_sys`")
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsGetTableByIndex() {
+    unimplemented!("not supported by `acpica_sys`")
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsGetTableByName() {
+    unimplemented!("not supported by `acpica_sys`")
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsGetTimer() -> u64 {
+    get_os_layer().get_timer()
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsSignal(Function: ACPI_SIGNAL, Info: *mut c_void) -> ACPI_STATUS {
+    get_os_layer().signal(Function, Info)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AcpiOsGetLine(
+    Buffer: *mut c_char,
+    BufferLength: u32,
+    BytesRead: *mut u32,
+) -> ACPI_STATUS {
+    get_os_layer().get_line(Buffer, BufferLength, BytesRead)
 }
 
 /// Internal trait implementing ACPICA OS layer functions. It is intended to be
@@ -351,6 +541,25 @@ pub trait OsLayerInternal: Send + Sync {
     fn terminate(&self);
 
     fn get_root_pointer(&self) -> ACPI_PHYSICAL_ADDRESS;
+
+    fn predefined_override(
+        &self,
+        PredefinedObject: *const ACPI_PREDEFINED_NAMES,
+        NewValue: *mut ACPI_STRING,
+    ) -> ACPI_STATUS;
+
+    fn table_override(
+        &self,
+        ExistingTable: *mut ACPI_TABLE_HEADER,
+        NewTable: *mut *mut ACPI_TABLE_HEADER,
+    ) -> ACPI_STATUS;
+
+    fn physical_table_override(
+        &self,
+        ExistingTable: *mut ACPI_TABLE_HEADER,
+        NewAddress: *mut ACPI_PHYSICAL_ADDRESS,
+        NewTableLength: u32,
+    ) -> ACPI_STATUS;
 
     fn map_memory(&self, PhysicalAddress: ACPI_PHYSICAL_ADDRESS, Length: ACPI_SIZE) -> *mut c_void;
     fn unmap_memory(&self, LogicalAddress: *mut c_void, Length: ACPI_SIZE);
@@ -400,6 +609,52 @@ pub trait OsLayerInternal: Send + Sync {
     fn delete_lock(&self, Handle: ACPI_SPINLOCK);
     fn acquire_lock(&self, Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS;
     fn release_lock(&self, Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS);
+
+    fn install_interrupt_handler(
+        &self,
+        InterruptLevel: u32,
+        Handler: Option<ACPI_OSD_HANDLER>,
+        Context: *mut c_void,
+    ) -> ACPI_STATUS;
+    fn remove_interrupt_handler(
+        &self,
+        InterruptNumber: u32,
+        Handler: Option<ACPI_OSD_HANDLER>,
+    ) -> ACPI_STATUS;
+
+    fn read_memory(
+        &self,
+        Address: ACPI_PHYSICAL_ADDRESS,
+        Value: *mut u64,
+        Width: u32,
+    ) -> ACPI_STATUS;
+    fn write_memory(&self, Address: ACPI_PHYSICAL_ADDRESS, Value: u64, Width: u32) -> ACPI_STATUS;
+
+    fn read_port(&self, Address: ACPI_IO_ADDRESS, Value: *mut u32, Width: u32) -> ACPI_STATUS;
+    fn write_port(&self, Address: ACPI_IO_ADDRESS, Value: u32, Width: u32) -> ACPI_STATUS;
+
+    fn read_pci_configuration(
+        &self,
+        PciId: ACPI_PCI_ID,
+        Register: u32,
+        Value: *mut u64,
+        Width: u32,
+    ) -> ACPI_STATUS;
+    fn write_pci_configuration(
+        &self,
+        PciId: ACPI_PCI_ID,
+        Register: u32,
+        Value: u64,
+        Width: u32,
+    ) -> ACPI_STATUS;
+
+    fn vprintf(&self, Format: *const c_char, Args: VaListImpl);
+
+    fn redirect_output(&self, Destination: *mut c_void);
+
+    fn get_timer(&self) -> u64;
+    fn signal(&self, Function: ACPI_SIGNAL, Info: *mut c_void) -> ACPI_STATUS;
+    fn get_line(&self, Buffer: *mut c_char, BufferLength: u32, BytesRead: *mut u32) -> ACPI_STATUS;
 }
 
 /// Adapter type for converting between [`OsLayer`][crate::OsLayer] and [`OsLayerInternal`].
@@ -417,6 +672,31 @@ impl<T: OsLayer> OsLayerInternal for OsLayerAdapter<T> {
 
     fn get_root_pointer(&self) -> ACPI_PHYSICAL_ADDRESS {
         self.0.get_root_address()
+    }
+
+    fn predefined_override(
+        &self,
+        PredefinedObject: *const ACPI_PREDEFINED_NAMES,
+        NewValue: *mut ACPI_STRING,
+    ) -> ACPI_STATUS {
+        todo!()
+    }
+
+    fn table_override(
+        &self,
+        ExistingTable: *mut ACPI_TABLE_HEADER,
+        NewTable: *mut *mut ACPI_TABLE_HEADER,
+    ) -> ACPI_STATUS {
+        todo!()
+    }
+
+    fn physical_table_override(
+        &self,
+        ExistingTable: *mut ACPI_TABLE_HEADER,
+        NewAddress: *mut ACPI_PHYSICAL_ADDRESS,
+        NewTableLength: u32,
+    ) -> ACPI_STATUS {
+        todo!()
     }
 
     fn map_memory(&self, PhysicalAddress: ACPI_PHYSICAL_ADDRESS, Length: ACPI_SIZE) -> *mut c_void {
@@ -607,7 +887,7 @@ impl<T: OsLayer> OsLayerInternal for OsLayerAdapter<T> {
 
         match self.0.spinlock_create() {
             Ok(handle) => {
-                // Safety: 
+                // Safety:
                 unsafe {
                     OutHandle.write(handle.into());
                 }
@@ -620,19 +900,218 @@ impl<T: OsLayer> OsLayerInternal for OsLayerAdapter<T> {
     }
 
     fn delete_lock(&self, Handle: ACPI_SPINLOCK) {
-        todo!()
+        self.0.spinlock_delete(Handle.into());
     }
 
     fn acquire_lock(&self, Handle: ACPI_SPINLOCK) -> ACPI_CPU_FLAGS {
-        todo!()
+        self.0.spinlock_acquire(Handle.into()).into()
     }
 
     fn release_lock(&self, Handle: ACPI_SPINLOCK, Flags: ACPI_CPU_FLAGS) {
+        self.0.spinlock_release(Handle.into(), Flags.into());
+    }
+
+    fn install_interrupt_handler(
+        &self,
+        InterruptLevel: u32,
+        Handler: Option<ACPI_OSD_HANDLER>,
+        Context: *mut c_void,
+    ) -> ACPI_STATUS {
+        let Some(Handler) = Handler else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        match self
+            .0
+            .install_interrupt_callback(InterruptLevel, Handler, Context)
+        {
+            Ok(()) => ACPI_STATUS::OK,
+
+            Err(InterruptCallbackInstallError::InvalidInterrupt) => ACPI_STATUS::BAD_PARAMETER,
+            Err(InterruptCallbackInstallError::AlreadyInstalled) => ACPI_STATUS::ALREADY_EXISTS,
+        }
+    }
+
+    fn remove_interrupt_handler(
+        &self,
+        InterruptNumber: u32,
+        Handler: Option<ACPI_OSD_HANDLER>,
+    ) -> ACPI_STATUS {
+        let Some(Handler) = Handler else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        match self.0.remove_interrupt_callback(InterruptNumber, Handler) {
+            Ok(()) => ACPI_STATUS::OK,
+
+            Err(InterruptCallbackRemoveError::InvalidInterrupt) => ACPI_STATUS::BAD_PARAMETER,
+            Err(InterruptCallbackRemoveError::CallbackMismatch) => ACPI_STATUS::BAD_PARAMETER,
+            Err(InterruptCallbackRemoveError::NotInstalled) => ACPI_STATUS::NOT_EXIST,
+        }
+    }
+
+    fn read_memory(
+        &self,
+        Address: ACPI_PHYSICAL_ADDRESS,
+        Value: *mut u64,
+        Width: u32,
+    ) -> ACPI_STATUS {
+        let Some(Value) = NonNull::new(Value) else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        let result = {
+            match Width {
+                u8::BITS => self.0.memory_read_u8(Address).map(u64::from),
+                u16::BITS => self.0.memory_read_u16(Address).map(u64::from),
+                u32::BITS => self.0.memory_read_u32(Address).map(u64::from),
+                u64::BITS => self.0.memory_read_u32(Address).map(u64::from),
+
+                _ => return ACPI_STATUS::BAD_PARAMETER,
+            }
+        };
+
+        match result {
+            Ok(value) => {
+                // Safety: ACPICA is required to ensure safety for this pointer write.
+                unsafe {
+                    Value.write(value);
+                }
+
+                ACPI_STATUS::OK
+            }
+
+            Err(MemoryIoError::InvalidAddress) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn write_memory(&self, Address: ACPI_PHYSICAL_ADDRESS, Value: u64, Width: u32) -> ACPI_STATUS {
+        let result = {
+            match Width {
+                u8::BITS if let Ok(Value) = u8::try_from(Value) => {
+                    self.0.memory_write_u8(Address, Value)
+                }
+
+                u16::BITS if let Ok(Value) = u16::try_from(Value) => {
+                    self.0.memory_write_u16(Address, Value)
+                }
+
+                u32::BITS if let Ok(Value) = u32::try_from(Value) => {
+                    self.0.memory_write_u32(Address, Value)
+                }
+
+                u64::BITS => self.0.memory_write_u64(Address, Value),
+
+                _ => return ACPI_STATUS::BAD_PARAMETER,
+            }
+        };
+
+        match result {
+            Ok(()) => ACPI_STATUS::OK,
+
+            Err(MemoryIoError::InvalidAddress) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn read_port(&self, Address: ACPI_IO_ADDRESS, Value: *mut u32, Width: u32) -> ACPI_STATUS {
+        let Some(Value) = NonNull::new(Value) else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        let result = {
+            match Width {
+                u8::BITS => self.0.port_read_u8(Address).map(u32::from),
+                u16::BITS => self.0.port_read_u16(Address).map(u32::from),
+                u32::BITS => self.0.port_read_u32(Address),
+
+                _ => return ACPI_STATUS::BAD_PARAMETER,
+            }
+        };
+
+        match result {
+            Ok(value) => {
+                // Safety: ACPICA is required to ensure safety for this pointer write.
+                unsafe {
+                    Value.write(value);
+                }
+
+                ACPI_STATUS::OK
+            }
+
+            Err(PortIoError::InvalidAddress) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn write_port(&self, Address: ACPI_IO_ADDRESS, Value: u32, Width: u32) -> ACPI_STATUS {
+        let result = {
+            match Width {
+                u8::BITS if let Ok(Value) = u8::try_from(Value) => {
+                    self.0.port_write_u8(Address, Value)
+                }
+
+                u16::BITS if let Ok(Value) = u16::try_from(Value) => {
+                    self.0.port_write_u16(Address, Value)
+                }
+
+                u32::BITS => self.0.port_write_u32(Address, Value),
+
+                _ => return ACPI_STATUS::BAD_PARAMETER,
+            }
+        };
+
+        match result {
+            Ok(()) => ACPI_STATUS::OK,
+
+            Err(PortIoError::InvalidAddress) => ACPI_STATUS::BAD_PARAMETER,
+        }
+    }
+
+    fn read_pci_configuration(
+        &self,
+        PciId: ACPI_PCI_ID,
+        Register: u32,
+        Value: *mut u64,
+        Width: u32,
+    ) -> ACPI_STATUS {
+        let Some(Value) = NonNull::new(Value) else {
+            return ACPI_STATUS::BAD_PARAMETER;
+        };
+
+        todo!()
+    }
+
+    fn write_pci_configuration(
+        &self,
+        PciId: ACPI_PCI_ID,
+        Register: u32,
+        Value: u64,
+        Width: u32,
+    ) -> ACPI_STATUS {
+        todo!()
+    }
+
+    fn vprintf(&self, Format: *const c_char, args: VaListImpl) {
+        todo!()
+    }
+
+    fn redirect_output(&self, Destination: *mut c_void) {
+        todo!()
+    }
+
+    fn get_timer(&self) -> u64 {
+        todo!()
+    }
+
+    fn signal(&self, Function: ACPI_SIGNAL, Info: *mut c_void) -> ACPI_STATUS {
+        todo!()
+    }
+
+    fn get_line(&self, Buffer: *mut c_char, BufferLength: u32, BytesRead: *mut u32) -> ACPI_STATUS {
         todo!()
     }
 }
 
-pub static OS_LAYER: spin::Once<&'static (dyn OsLayerInternal)> = spin::Once::new();
+pub static OS_LAYER: spin::Once<&'static dyn OsLayerInternal> = spin::Once::new();
 
 fn get_os_layer() -> &'static dyn OsLayerInternal {
     *OS_LAYER
